@@ -74,7 +74,18 @@ private:
 		}
 	};
 
-	using EventList     = std::list<KernelEqueueEvent>;
+	/// Pairs a registration with the identity it was indexed under.
+	///
+	/// Filter callbacks receive a mutable `KernelEqueueEvent*` and may rewrite `ident` or
+	/// `filter`, so index maintenance has to use the key captured at registration rather than
+	/// the event's current fields. Erasing a mutated key would leave the original index entry
+	/// behind, pointing at a node that no longer exists.
+	struct EventNode {
+		EventKey          key;
+		KernelEqueueEvent event;
+	};
+
+	using EventList     = std::list<EventNode>;
 	using EventIterator = EventList::iterator;
 
 	void TriggerExpiredTimers(uint64_t now_ns);
@@ -102,7 +113,8 @@ void KernelEqueuePrivate::Close() {
 		return;
 	}
 	m_closed = true;
-	for (auto& event: m_events) {
+	for (auto& node: m_events) {
+		auto& event = node.event;
 		if (event.filter.delete_event_func != nullptr) {
 			auto owner = event.filter.owner;
 			event.filter.delete_event_func(m_handle, &event);
@@ -127,7 +139,7 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 	int ret = 0;
 
 	for (auto it = m_events.begin(); it != m_events.end();) {
-		auto& event = *it;
+		auto& event = it->event;
 		bool  erase = false;
 		while (event.triggered) {
 			ev[ret++] = event.event;
@@ -155,7 +167,9 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 			}
 		}
 		if (erase) {
-			m_event_index.erase(EventKey {event.event.ident, event.event.filter});
+			// Erase by the registered key: a trigger callback may have rewritten the ident or
+			// filter stored inside the event since it was added.
+			m_event_index.erase(it->key);
 			it = m_events.erase(it);
 		} else {
 			it = std::next(it);
@@ -169,7 +183,8 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 }
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
-	for (auto& event: m_events) {
+	for (auto& node: m_events) {
+		auto& event = node.event;
 		if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
 			event.triggered = true;
 		}
@@ -180,7 +195,8 @@ bool KernelEqueuePrivate::GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait
 	EXIT_IF(wait_micros == nullptr);
 
 	uint64_t nearest_deadline = UINT64_MAX;
-	for (const auto& event: m_events) {
+	for (const auto& node: m_events) {
+		const auto& event = node.event;
 		if (!event.triggered && event.deadline_ns != 0) {
 			nearest_deadline = std::min(nearest_deadline, event.deadline_ns);
 		}
@@ -240,14 +256,14 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 	const EventKey key {event.event.ident, event.event.filter};
 	const auto     indexed = m_event_index.find(key);
 	if (indexed != m_event_index.end()) {
-		auto it         = indexed->second;
-		it->deadline_ns = event.deadline_ns;
-		it->event.udata = event.event.udata;
-		for (auto& pending: it->pending_events) {
+		auto& existing       = indexed->second->event;
+		existing.deadline_ns = event.deadline_ns;
+		existing.event.udata = event.event.udata;
+		for (auto& pending: existing.pending_events) {
 			pending.udata = event.event.udata;
 		}
 	} else {
-		m_events.push_back(event);
+		m_events.push_back(EventNode {key, event});
 		m_event_index.emplace(key, std::prev(m_events.end()));
 	}
 
@@ -264,8 +280,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 	}
 	const auto indexed = m_event_index.find(EventKey {ident, filter});
 	if (indexed != m_event_index.end()) {
-		auto  it    = indexed->second;
-		auto& event = *it;
+		auto& event = indexed->second->event;
 
 		if (event.filter.trigger_func != nullptr) {
 			event.filter.trigger_func(&event, trigger_data);
@@ -318,8 +333,8 @@ int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 	}
 	const auto indexed = m_event_index.find(EventKey {ident, filter});
 	if (indexed != m_event_index.end()) {
-		auto  it    = indexed->second;
-		auto& event = *it;
+		const auto it    = indexed->second;
+		auto&      event = it->event;
 
 		if (event.filter.delete_event_func != nullptr) {
 			auto owner = event.filter.owner;

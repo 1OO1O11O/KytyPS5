@@ -474,6 +474,94 @@ void TestLargeQueueLookupAndOneshotRemoval() {
 	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete large indexed queue");
 }
 
+constexpr uintptr_t RenamedIdent  = 0xdead;
+constexpr int16_t   RenamedFilter = EventQueue::KERNEL_EVFILT_READ;
+
+/// Rewrites the guest-visible identity of the event it is invoked for. Filters own the event
+/// contents, so the queue must keep indexing the registration under the key it was added with.
+void RenameTriggeredEvent(EventQueue::KernelEqueueEvent* event, void* trigger_data) {
+	event->event.ident  = RenamedIdent;
+	event->event.filter = RenamedFilter;
+	event->event.data   = reinterpret_cast<intptr_t>(trigger_data);
+	event->triggered    = true;
+}
+
+/// Verifies that a trigger callback which rewrites `ident` or `filter` cannot corrupt the event
+/// index: a consumed one-shot must drop its entry, and a surviving registration must stay
+/// reachable under the key it was registered with.
+void TestTriggerCallbackMutationKeepsIndexConsistent() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "mutating-trigger") == OK,
+	      "create mutating trigger queue");
+
+	EventQueue::KernelEqueueEvent oneshot {};
+	oneshot.event.ident         = 5;
+	oneshot.event.filter        = EventQueue::KERNEL_EVFILT_USER;
+	oneshot.event.flags         = 0x10; // EV_ONESHOT
+	oneshot.filter.trigger_func = RenameTriggeredEvent;
+	Check(EventQueue::KernelAddEvent(queue, oneshot) == OK, "add renaming one-shot event");
+	Check(EventQueue::KernelTriggerEvent(queue, 5, EventQueue::KERNEL_EVFILT_USER,
+	                                     reinterpret_cast<void*>(0x4321)) == OK,
+	      "trigger renaming one-shot event");
+
+	EventQueue::KernelEvent         event {};
+	int                             out     = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &out, &timeout) == OK && out == 1,
+	      "consume renamed one-shot event");
+	Check(event.ident == RenamedIdent && event.filter == RenamedFilter,
+	      "trigger callback owns the reported event identity");
+
+	Check(EventQueue::KernelTriggerEvent(queue, RenamedIdent, RenamedFilter, nullptr) ==
+	          KERNEL_ERROR_ENOENT,
+	      "renamed one-shot is not reachable under the mutated key");
+	Check(EventQueue::KernelDeleteEvent(queue, RenamedIdent, RenamedFilter) == KERNEL_ERROR_ENOENT,
+	      "renamed one-shot leaves no entry under the mutated key");
+	Check(EventQueue::KernelTriggerEvent(queue, 5, EventQueue::KERNEL_EVFILT_USER, nullptr) ==
+	          KERNEL_ERROR_ENOENT,
+	      "consumed one-shot drops its registered index entry");
+
+	// The stale entry a mutated key would have left behind referenced the erased list node, so
+	// reusing the registered key has to produce a fresh, usable registration.
+	EventQueue::KernelEqueueEvent reused {};
+	reused.event.ident  = 5;
+	reused.event.filter = EventQueue::KERNEL_EVFILT_USER;
+	reused.event.udata  = reinterpret_cast<void*>(0x9876);
+	Check(EventQueue::KernelAddEvent(queue, reused) == OK, "re-add event under the reused key");
+	Check(EventQueue::KernelTriggerEvent(queue, 5, EventQueue::KERNEL_EVFILT_USER, nullptr) == OK,
+	      "trigger event re-added under the reused key");
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &out, &timeout) == OK && out == 1,
+	      "receive event re-added under the reused key");
+	Check(event.ident == 5 && event.udata == reinterpret_cast<void*>(0x9876),
+	      "re-added event reports its own identity");
+	Check(EventQueue::KernelDeleteEvent(queue, 5, EventQueue::KERNEL_EVFILT_USER) == OK,
+	      "delete event re-added under the reused key");
+
+	// A surviving registration keeps the identity it was indexed under, even after a callback
+	// rewrote the event it reports to the guest.
+	EventQueue::KernelEqueueEvent persistent {};
+	persistent.event.ident              = 6;
+	persistent.event.filter             = EventQueue::KERNEL_EVFILT_USER;
+	persistent.event.flags              = 0x20; // EV_CLEAR
+	persistent.filter.trigger_func      = RenameTriggeredEvent;
+	persistent.filter.delete_event_func = CountDeletedEvent;
+	std::atomic_uint32_t delete_count {0};
+	persistent.filter.data = &delete_count;
+	Check(EventQueue::KernelAddEvent(queue, persistent) == OK, "add renaming persistent event");
+	Check(EventQueue::KernelTriggerEvent(queue, 6, EventQueue::KERNEL_EVFILT_USER, nullptr) == OK,
+	      "trigger renaming persistent event");
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &out, &timeout) == OK && out == 1,
+	      "consume renamed persistent event");
+	Check(EventQueue::KernelDeleteEvent(queue, RenamedIdent, RenamedFilter) == KERNEL_ERROR_ENOENT,
+	      "persistent registration is not reachable under the mutated key");
+	Check(EventQueue::KernelDeleteEvent(queue, 6, EventQueue::KERNEL_EVFILT_USER) == OK,
+	      "persistent registration stays reachable under its registered key");
+	Check(delete_count.load(std::memory_order_relaxed) == 1,
+	      "deleting the renamed registration invokes its callback once");
+
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete mutating trigger queue");
+}
+
 } // namespace
 
 int main() {
@@ -485,6 +573,7 @@ int main() {
 	TestConcurrentCloseCallback();
 	TestConcurrentDelete();
 	TestLargeQueueLookupAndOneshotRemoval();
+	TestTriggerCallbackMutationKeepsIndexConsistent();
 	std::printf("EventQueueLifetimeTests: all cases passed\n");
 	return 0;
 }

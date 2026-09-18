@@ -1568,14 +1568,11 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 	}
 	const auto dma_src = CopyDataSrcToDma(src_sel);
 	if (dma_src == 2 && num_bytes == 8) {
-		// DMA_DATA's immediate source is a repeated 32-bit fill value, while COPY_DATA stores
-		// the complete 64-bit immediate in its two source dwords. Preserve both halves by
-		// issuing one dword write for each destination address.
-		const auto dma_dst = CopyDataDstToDma(dst_sel);
-		cp.DmaData(0, dma_dst, dst_cache, dst, dma_src, src_cache, src, sizeof(uint32_t), 1,
-		           write_confirm, 1);
-		cp.DmaData(0, dma_dst, dst_cache, dst + sizeof(uint32_t), dma_src, src_cache, src >> 32u,
-		           sizeof(uint32_t), 1, write_confirm, 1);
+		// COPY_DATA carries the complete 64-bit immediate in its two source dwords, while
+		// DMA_DATA's immediate source is a repeated 32-bit fill value. Hand the full value to
+		// the command processor, which preserves both halves and validates the eight-byte
+		// destination as a single write.
+		cp.DmaDataImmediate64(CopyDataDstToDma(dst_sel), dst_cache, dst, src, write_confirm);
 		return 5;
 	}
 
