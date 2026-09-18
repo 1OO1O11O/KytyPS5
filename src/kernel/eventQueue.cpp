@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <fmt/format.h>
+#include <functional>
 #include <limits>
 #include <list>
 #include <unordered_map>
@@ -55,21 +56,45 @@ public:
 	void Close();
 
 private:
+	struct EventKey {
+		uintptr_t ident;
+		int16_t   filter;
+
+		/// Compares the complete guest-visible identity of two registrations.
+		bool operator==(const EventKey&) const = default;
+	};
+
+	struct EventKeyHash {
+		/// Hashes an event identifier and filter for average constant-time lookup.
+		size_t operator()(const EventKey& key) const noexcept {
+			const auto ident_hash  = std::hash<uintptr_t> {}(key.ident);
+			const auto filter_hash = std::hash<int16_t> {}(key.filter);
+			return ident_hash ^
+			       (filter_hash + 0x9e3779b9u + (ident_hash << 6u) + (ident_hash >> 2u));
+		}
+	};
+
+	using EventList     = std::list<KernelEqueueEvent>;
+	using EventIterator = EventList::iterator;
+
 	void TriggerExpiredTimers(uint64_t now_ns);
 	bool GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait_micros) const;
 
-	std::list<KernelEqueueEvent> m_events;
-	Common::Mutex                m_mutex;
-	Common::CondVar              m_cond_var;
-	std::string                  m_name;
-	KernelEqueue                 m_handle = KERNEL_EQUEUE_INVALID;
-	bool                         m_closed = false;
+	EventList                                                 m_events;
+	std::unordered_map<EventKey, EventIterator, EventKeyHash> m_event_index;
+	Common::Mutex                                             m_mutex;
+	Common::CondVar                                           m_cond_var;
+	std::string                                               m_name;
+	KernelEqueue                                              m_handle = KERNEL_EQUEUE_INVALID;
+	bool                                                      m_closed = false;
 };
 
+/// Closes the queue before its final pinned reference releases the storage.
 KernelEqueuePrivate::~KernelEqueuePrivate() {
 	Close();
 }
 
+/// Marks the queue closed, releases registrations, and wakes every waiter.
 void KernelEqueuePrivate::Close() {
 	Common::LockGuard lock(m_mutex);
 
@@ -84,9 +109,11 @@ void KernelEqueuePrivate::Close() {
 		}
 	}
 	m_events.clear();
+	m_event_index.clear();
 	m_cond_var.SignalAll();
 }
 
+/// Copies up to `num` ready events into `ev` and retires consumed one-shot registrations.
 int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 	Common::LockGuard lock(m_mutex);
 
@@ -127,7 +154,12 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				break;
 			}
 		}
-		it = (erase ? m_events.erase(it) : std::next(it));
+		if (erase) {
+			m_event_index.erase(EventKey {event.event.ident, event.event.filter});
+			it = m_events.erase(it);
+		} else {
+			it = std::next(it);
+		}
 		if (ret >= num) {
 			break;
 		}
@@ -198,17 +230,17 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	return 0;
 }
 
+/// Adds a registration or updates the mutable metadata of an existing registration.
 int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_closed) {
 		return KERNEL_ERROR_EBADF;
 	}
-	auto it = std::find_if(m_events.begin(), m_events.end(),
-	                       [ident = event.event.ident, filter = event.event.filter](const auto& e) {
-		                       return e.event.ident == ident && e.event.filter == filter;
-	                       });
-	if (it != m_events.end()) {
+	const EventKey key {event.event.ident, event.event.filter};
+	const auto     indexed = m_event_index.find(key);
+	if (indexed != m_event_index.end()) {
+		auto it         = indexed->second;
 		it->deadline_ns = event.deadline_ns;
 		it->event.udata = event.event.udata;
 		for (auto& pending: it->pending_events) {
@@ -216,22 +248,23 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		}
 	} else {
 		m_events.push_back(event);
+		m_event_index.emplace(key, std::prev(m_events.end()));
 	}
 
 	m_cond_var.Signal();
 	return OK;
 }
 
+/// Marks the registration selected by `ident` and `filter` as ready.
 int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_closed) {
 		return KERNEL_ERROR_EBADF;
 	}
-	auto it = std::find_if(m_events.begin(), m_events.end(), [ident, filter](const auto& e) {
-		return e.event.ident == ident && e.event.filter == filter;
-	});
-	if (it != m_events.end()) {
+	const auto indexed = m_event_index.find(EventKey {ident, filter});
+	if (indexed != m_event_index.end()) {
+		auto  it    = indexed->second;
 		auto& event = *it;
 
 		if (event.filter.trigger_func != nullptr) {
@@ -276,16 +309,16 @@ static void UserEventResetFunc(KernelEqueueEvent* event) {
 	}
 }
 
+/// Removes the registration selected by `ident` and `filter`.
 int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_closed) {
 		return KERNEL_ERROR_EBADF;
 	}
-	auto it = std::find_if(m_events.begin(), m_events.end(), [ident, filter](const auto& e) {
-		return e.event.ident == ident && e.event.filter == filter;
-	});
-	if (it != m_events.end()) {
+	const auto indexed = m_event_index.find(EventKey {ident, filter});
+	if (indexed != m_event_index.end()) {
+		auto  it    = indexed->second;
 		auto& event = *it;
 
 		if (event.filter.delete_event_func != nullptr) {
@@ -294,6 +327,7 @@ int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 		}
 
 		m_events.erase(it);
+		m_event_index.erase(indexed);
 
 		return OK;
 	}

@@ -428,6 +428,52 @@ void TestConcurrentDelete() {
 	}
 }
 
+/// Verifies indexed lookup and index cleanup under a realistically large
+/// registration set.
+void TestLargeQueueLookupAndOneshotRemoval() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "large-indexed-queue") == OK,
+	      "create large indexed queue");
+
+	constexpr uintptr_t EventCount = 4096;
+	for (uintptr_t ident = 0; ident < EventCount; ++ident) {
+		EventQueue::KernelEqueueEvent event {};
+		event.event.ident  = ident;
+		event.event.filter = EventQueue::KERNEL_EVFILT_GRAPHICS;
+		event.event.flags  = 0x20;
+		Check(EventQueue::KernelAddEvent(queue, event) == OK, "populate large indexed queue");
+	}
+
+	const auto target = EventCount - 1;
+	Check(EventQueue::KernelTriggerEvent(queue, target, EventQueue::KERNEL_EVFILT_GRAPHICS,
+	                                     nullptr) == OK,
+	      "trigger event at end of large queue");
+	EventQueue::KernelEvent event {};
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	int                             out     = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &out, &timeout) == OK && out == 1,
+	      "receive event from large queue");
+	Check(event.ident == target, "large queue lookup selected the correct event");
+
+	EventQueue::KernelEqueueEvent oneshot {};
+	oneshot.event.ident  = EventCount;
+	oneshot.event.filter = EventQueue::KERNEL_EVFILT_GRAPHICS;
+	oneshot.event.flags  = 0x10;
+	Check(EventQueue::KernelAddEvent(queue, oneshot) == OK, "add indexed one-shot event");
+	Check(EventQueue::KernelTriggerEvent(queue, oneshot.event.ident, oneshot.event.filter, nullptr) ==
+	          OK,
+	      "trigger indexed one-shot event");
+	Check(EventQueue::KernelWaitEqueue(queue, &event, 1, &out, &timeout) == OK && out == 1,
+	      "consume indexed one-shot event");
+	Check(EventQueue::KernelTriggerEvent(queue, oneshot.event.ident, oneshot.event.filter, nullptr) ==
+	          KERNEL_ERROR_ENOENT,
+	      "one-shot consumption removes event index");
+	Check(EventQueue::KernelAddEvent(queue, oneshot) == OK, "re-add consumed one-shot event");
+	Check(EventQueue::KernelDeleteEvent(queue, oneshot.event.ident, oneshot.event.filter) == OK,
+	      "delete re-added indexed event");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete large indexed queue");
+}
+
 } // namespace
 
 int main() {
@@ -438,6 +484,7 @@ int main() {
 	TestStaleHandleNeverAliasesNewQueue();
 	TestConcurrentCloseCallback();
 	TestConcurrentDelete();
+	TestLargeQueueLookupAndOneshotRemoval();
 	std::printf("EventQueueLifetimeTests: all cases passed\n");
 	return 0;
 }
