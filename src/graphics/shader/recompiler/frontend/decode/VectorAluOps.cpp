@@ -247,7 +247,7 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
     {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
     {0xceu, Opcode::V_CMP_GE_F16},         {0xebu, Opcode::V_CMP_NGT_F16},
-    {0xedu, Opcode::V_CMP_NEQ_F16},
+    {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
@@ -295,6 +295,7 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x300u, Opcode::V_LSHRREV_B64},
     {0x303u, Opcode::V_ADD_NC_U16},
     {0x304u, Opcode::V_SUB_NC_U16},
+    {0x305u, Opcode::V_MUL_LO_U16},
     {0x307u, Opcode::V_LSHRREV_B16},
     {0x308u, Opcode::V_ASHRREV_I16},
     {0x309u, Opcode::V_MAX_U16},
@@ -430,6 +431,7 @@ bool IsNativeVop3B16BinaryOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:
@@ -828,6 +830,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_GE_F16:
 		case Opcode::V_CMP_NGT_F16:
 		case Opcode::V_CMP_NEQ_F16:
+		case Opcode::V_CMP_NLT_F16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
@@ -1174,6 +1177,7 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 		case Opcode::V_MUL_I32_I24:
 		case Opcode::V_ADD_NC_U16:
 		case Opcode::V_SUB_NC_U16:
+		case Opcode::V_MUL_LO_U16:
 		case Opcode::V_MAX_U16:
 		case Opcode::V_MAX_I16:
 		case Opcode::V_MIN_U16:
